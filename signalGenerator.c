@@ -1,6 +1,20 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h> 
 
-// TODO añadir suma de n channels restantes al recorrido del buffer, para saltar todos los canales superiores a 3
-// if(nChannels > 3) ledCfg->buffer += ledCfg->nChannels - 3;
+
+// User selectable configuration
+#define SAMPLE_SIZE		1		// Size of each resulting signal sample, in bytes
+
+
+
+// Not user selectable configuration
+
+#if !(SAMPLE_SIZE == 1		\
+	||SAMPLE_SIZE == 2		\
+	||SAMPLE_SIZE == 4)	 
+#error "invalid sample size"
+#endif
 
 
 #define CONV_US_2_S			1000UL
@@ -11,7 +25,7 @@
 // Needs to be interpolated to turn into a 256 values array and then divided by 2^16 
 // to enter in the range 0-255, if needed
 // Formula: val[i] = logScale[i/8] + (logScale[(i/8)+1] - logScale[i/8])*(i%8)/8
-const uint16_t logScale[33] = {
+static const uint16_t logScale[33] = {
 	0,    55,   114,   184,   267,   366,   484,   624, 
 	790,   988,  1224,  1504,  1837,  2233,  2704,  3264, 
 	3930,  4722,  5663,  6783,  8115,  9699, 11583, 13823, 
@@ -23,13 +37,13 @@ const uint16_t logScale[33] = {
 // Lookup table for sine. Just a quarter is needed to make the whole set of values
 // Formula for interpolating from 32 values to 256
 // val[i] = sineQuarter[i/8] + (sineQuarter[(i/8)+1] - sineQuarter[i/8])*(i%8)/8
-const uint16_t sineQuarter[33] = {
+static const uint16_t sineQuarter[33] = {
 	0, 3228, 6449, 9653, 12835, 15985, 19096, 22161, 
 	25172, 28122, 31004, 33811, 36535, 39171, 41711, 44151, 
 	46483, 48702, 50803, 52781, 54630, 56347, 57927, 59366,
 	60662, 61810, 62808, 63653, 64344, 64878, 65255, 65474, 
 	65535
-}
+};
 
 
 typedef enum {
@@ -78,14 +92,13 @@ typedef enum {
 
 
 typedef struct {
-	void     *buffer;
+	uint8_t  *buffer;
 	uint32_t upperLimit;	// Value for 100% PWM
 	uint32_t nElem; 
 	ledCol_t color;
 	ledPat_t pattern;
 	uint8_t  nChannels;		// 1 for colors with one component, 2 min for colors with two and 3 for RGB colors
 	uint8_t  duty;			// For square signal, duty cycle. 0-100
-	uint8_t  chSize;		// Size of values, how many bytes per sample in the pattern
 	uint8_t  intensity;		// Scaler from 0 to 100 to scale color intensity
 	bool     useLogScale;	// Compensate for brightness, so that 50% is half brightness of 100% (use log scale)
 } ledCfg_t;
@@ -98,243 +111,170 @@ typedef enum {
 } ledErr_t;
 
 
+/*****************************************
+            Helper functions
+******************************************/
 
 
-
-void led_SqrFillMem(ledCfg_t *ledCfg, uint32_t *colors, uint32_t nElemHigh, uint32_t nElemLow)
+static inline void insertSample(uint8_t *ptr, uint32_t data)
 {
-	switch(ledCfg->nChannels)
-	{
-		case 1:
-		for(; nElemHigh>0; nElemHigh--)
-		{
-			*ledCfg->buffer = colors[0];
-			ledCfg->buffer += ledCfg->chSize;
-		}		
-		break;
-		case 2:
-		for(; nElemHigh>0; nElemHigh--)
-		{
-			*ledCfg->buffer = colors[0];
-			ledCfg->buffer += ledCfg->chSize;
-			*ledCfg->buffer = colors[1];
-			ledCfg->buffer += ledCfg->chSize;
-		}		
-		break;
-		case 3:
-		for(; nElemHigh>0; nElemHigh--)
-		{
-			*ledCfg->buffer = colors[0];
-			ledCfg->buffer += ledCfg->chSize;
-			*ledCfg->buffer = colors[1];
-			ledCfg->buffer += ledCfg->chSize;
-			*ledCfg->buffer = colors[2];
-			ledCfg->buffer += ledCfg->chSize;
-		}		
-		break;
-		default:
-		return; // Unknown error
-		break;
-	}
-
-	memset(ledCfg->buffer, 0, nElemLow*ledCfg->chSize*ledCfg->nChannels);
+	*ptr = data&0xFF;
+#if SAMPLE_SIZE > 1
+	*(ptr+1) = (data>>8)&0xFF;
+#if SAMPLE_SIZE > 2
+	*(ptr+2) = (data>>16)&0xFF;
+	*(ptr+3) = (data>>24)&0xFF;
+#endif
+#endif
 }
 
 
+/*****************************************
+        end Helper functions
+******************************************/
+
+typedef void (*led_getColors_t)(uint32_t, ledCfg_t, uint32_t);
 
 // Gets the color components from the palette, which is 8b, and 
 // scales them to peakVal, so that UINT8_MAX is converted to peakVal
-void led_assignColors(uint32_t *colors, ledCol_t ledColor, bool useLogScale, uint32_t peakVal)
+static void led_getColorsLin(uint32_t *colors, ledCfg_t *ledCfg, uint32_t peakVal)
 {
-	if(useLogScale)
-	{
-		uint8_t  i;
-		uint8_t  idx;
-		uint16_t logVal;
-
-		for(i=0;i<3;i++)
-		{
-			idx       = palette[ledColor].ch[i];
-			logVal    = logScale[idx/8] + (logScale[(idx/8)+1] - logScale[idx/8])*(idx%8)/8;
-			colors[i] = ((uint64_t)peakVal * logVal) / UINT16_MAX;
-		}
-
-	} else {
-		colors[0] = ((uint64_t)peakVal * colors[ledColor].ch[0]) / UINT8_MAX;
-		colors[1] = ((uint64_t)peakVal * colors[ledColor].ch[1]) / UINT8_MAX;
-		colors[2] = ((uint64_t)peakVal * colors[ledColor].ch[2]) / UINT8_MAX;	
-	}
-
+	uint8_t i;
+	for(i=0; i<ledCfg->nChannels; i++)
+		colors[i] = ((uint64_t)peakVal * palette[ledCfg->color].ch[i]) / UINT8_MAX;
 }
 
 
 
-void led_genPatSqr(ledCfg_t *ledCfg)
+static void led_getColorsLog(uint32_t *colors, ledCfg_t *ledCfg, uint32_t peakVal)
+{
+	uint8_t i;
+	uint8_t idx;
+
+	for(i=0; i<ledCfg->nChannels; i++)
+	{
+		idx = palette[ledCfg->color].ch[i];		// Get color components from palette
+		// Convert to log and scale to peakVal
+		colors[i] = logScale[idx/8] + (logScale[(idx/8)+1] - logScale[idx/8])*(idx%8)/8;
+		colors[i] = ((uint64_t)peakVal * colors[i]) / UINT8_MAX;
+	}
+}
+
+
+static void led_genPatSqr(ledCfg_t *ledCfg)
 {
 	uint32_t peakVal   = ((uint64_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
 	uint32_t nElemHigh = ((uint64_t)ledCfg->nElem * ledCfg->duty) / 100UL;
 	uint32_t nElemLow  = ledCfg->nElem - nElemHigh;
 	uint32_t colors[3];
+	uint8_t  i;
 
+	if(ledCfg->useLogScale)
+		led_getColorsLog(colors, ledCfg, peakVal);
+	else
+		led_getColorsLin(colors, ledCfg, peakVal);
 
-	led_assignColors(colors, ledCfg->color, ledCfg->useLogScale, peakVal); 
-	led_SqrFillMem(ledCfg, colors, nElemHigh, nElemLow);
+	for(; nElemHigh>0; nElemHigh--)
+	{
+		for(i=0;i<ledCfg->nChannels;i++)
+		{
+			insertSample(ledCfg->buffer, colors[i]);
+			ledCfg->buffer += SAMPLE_SIZE;
+		}
+	}
+	memset(ledCfg->buffer, 0, nElemLow * ledCfg->nChannels * SAMPLE_SIZE);
 }
 
 
-
-void led_genPatRamp(ledCfg_t *ledCfg)
+// TODO compensar si hubiera que hacer curva logaritmica
+static void led_genPatRamp(ledCfg_t *ledCfg)
 {
 	uint32_t peakVal = ((uint64_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
 	uint32_t value;
 	uint32_t colors[3];
-	uint32_t i;
+	uint32_t i, j, temp;
 
+	// Get final color components for ramp
+	for(i=0; i<ledCfg->nChannels; i++)
+		colors[i] = palette[ledCfg->color].ch[i];
 
-	led_assignColors(colors, ledCfg->color, ledCfg->useLogScale, peakVal);
-
-	switch(ledCfg->nChannels)
+	// Build ramp with colors scaled linearly or in a logarithmic way
+	for(j=0; j<ledCfg->nElem; j++)
 	{
-		case 1:
-		for(i=0; i<ledCfg->nElem; i++)
+		for(i=0;i<ledCfg->nChannels;i++)
 		{
-			value = ((uint64_t)color[0] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
+			value = ((uint64_t)colors[i] * j)/ledCfg->nElem;
+			if(ledCfg->useLogScale)
+			{
+				value = logScale[value/8] + (logScale[(value/8)+1] - logScale[value/8])*(value%8)/8;
+				value = ((uint64_t)peakVal * value) / 65535;
+			}else{
+				value = ((uint64_t)peakVal * value) / 255;
+			}
+
+			insertSample(ledCfg->buffer, value);
+			ledCfg->buffer += SAMPLE_SIZE;
 		}
-		break;
-		case 2:
-		for(i=0; i<ledCfg->nElem; i++)
-		{
-			value = ((uint64_t)color[0] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		case 3:
-		for(i=0; i<ledCfg->nElem; i++)
-		{
-			value = ((uint64_t)color[0] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[2] * i)/ledCfg->nElem;
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		default:
-		return;
-		break;
 	}
 }
 
 
 
-void led_genPatTri(ledCfg_t *ledCfg)
+static void led_genPatTri(ledCfg_t *ledCfg)
 {
-	uint32_t highVal = ((uint64_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
+	uint32_t peakVal  = ((uint64_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
 	uint32_t value;
 	uint32_t colors[3];
-	uint32_t i;
+	uint32_t i, j;
 
+	// Get final color components for ramp
+	for(i=0; i<ledCfg->nChannels; i++)
+		colors[i] = palette[ledCfg->color].ch[i];
 
-	led_assignColors(colors, ledCfg->color, ledCfg->useLogScale);
-
-	switch(ledCfg->nChannels)
+	for(j=0; j<ledCfg->nElem/2; j++)
 	{
-		case 1:
-		for(i=0; i<ledCfg->nElem/2; i++)
+		for(i=0;i<ledCfg->nChannels;i++)
 		{
-			value = ((uint64_t)color[0] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
+			value = ((uint64_t)colors[i] * j)/(ledCfg->nElem / 2);
+			if(ledCfg->useLogScale)
+			{
+				value = logScale[value/8] + (logScale[(value/8)+1] - logScale[value/8])*(value%8)/8;
+				value = ((uint64_t)peakVal * value) / 65535;
+			}else{
+				value = ((uint64_t)peakVal * value) / 255;
+			}
+			insertSample(ledCfg->buffer, value);
+			ledCfg->buffer += SAMPLE_SIZE;
 		}
-		break;
-		case 2:
-		for(i=0; i<ledCfg->nElem/2; i++)
-		{
-			value = ((uint64_t)color[0] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		case 3:
-		for(i=0; i<ledCfg->nElem/2; i++)
-		{
-			value = ((uint64_t)color[0] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[2] * i)/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		default:
-		return;
-		break;
 	}
 
-	switch(ledCfg->nChannels)
+	for(; j>0; j--)
 	{
-		case 1:
-		for(i=ledCfg->nElem/2; i>0; i--)
+		for(i=0;i<ledCfg->nChannels;i++)
 		{
-			value = ((uint64_t)color[0] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
+			value = ((uint64_t)colors[i] * j)/(ledCfg->nElem / 2);
+			if(ledCfg->useLogScale)
+			{
+				value = logScale[value/8] + (logScale[(value/8)+1] - logScale[value/8])*(value%8)/8;
+				value = ((uint64_t)peakVal * value) / 65535;
+			}else{
+				value = ((uint64_t)peakVal * value) / 255;
+			}
+
+			insertSample(ledCfg->buffer, value);
+			ledCfg->buffer += SAMPLE_SIZE;
 		}
-		break;
-		case 2:
-		for(i=ledCfg->nElem/2; i>0; i--)
-		{
-			value = ((uint64_t)color[0] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		case 3:
-		for(i=ledCfg->nElem/2; i>0; i--)
-		{
-			value = ((uint64_t)color[0] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[1] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-			value = ((uint64_t)color[2] * (i-1))/(ledCfg->nElem/2);
-			*ledCfg->buffer = value;
-			ledCfg->buffer += ledCfg->chSize;
-		}
-		break;
-		default:
-		return;
-		break;
 	}
 }
 
 
 
-void led_genPatSine(ledCfg_t *ledCfg)
+static void led_genPatSine(ledCfg_t *ledCfg)
 {
 
 
 
-val[i] = sineQuarter[i/8] + (sineQuarter[(i/8)+1] - sineQuarter[i/8])*(i%8)/8
+//val[i] = sineQuarter[i/8] + (sineQuarter[(i/8)+1] - sineQuarter[i/8])*(i%8)/8
 }
 
 
@@ -342,15 +282,13 @@ val[i] = sineQuarter[i/8] + (sineQuarter[(i/8)+1] - sineQuarter[i/8])*(i%8)/8
 ledErr_t led_genPattern(ledCfg_t *ledCfg)
 {
 	if(ledCfg->buffer    == NULL 
-		|| ledCfg->color     >= LED_COLOR_COUNT
+		|| ledCfg->color     >= LED_COLOR_CNT
 		|| ledCfg->pattern   >= LED_PAT_CNT
 		|| ledCfg->nChannels == 0
 		|| ledCfg->nChannels <  palette[ledCfg->pattern].nChReq
 		|| ledCfg->nChannels >  3
 		|| (!(ledCfg->pattern == LED_PAT_SQR) 
 			|| ledCfg->duty  >  100)
-		|| ledCfg->chSize    == 0
-		|| ledCfg->chSize    >  4
 		|| ledCfg->intensity >  100)
 		return LED_ERR_INVALID_PARAMS;
 
