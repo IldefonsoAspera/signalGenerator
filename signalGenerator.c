@@ -3,6 +3,8 @@
 #include <string.h>
 #include "signalGenerator.h"
 
+#define ARRAY_LENGTH(x)	(sizeof(x))/(sizeof(x[0]))
+
 // TODO hacer union en duty para que se reutilice para invertir las señales
 
 // Created with formula: X = 2^((n+1)/32 + 8) - 2^(1/32 + 8)*(255-n)/255
@@ -53,7 +55,7 @@ typedef struct {
 // For 2 colors, channels red and green will be used
 // Color array is organized as {R,G,B}. Position 0
 // indicates minimum number of channels required for color
-const color_t palette[LED_COLOR_CNT] = {
+const color_t palette[SIG_COLOR_CNT] = {
 		{1, {0, 0, 0}},
 		{1, {255, 0, 0}},
 		{2, {0, 255, 0}},
@@ -70,7 +72,7 @@ const color_t palette[LED_COLOR_CNT] = {
 /*****************************************
             Helper functions
  ******************************************/
-//typedef void (*led_getColors_t)(uint32_t, ledCfg_t, uint32_t);
+//typedef void (*sig_getColors_t)(uint32_t, sigCfg_t, uint32_t);
 
 static inline void insertSample(uint8_t **p_ptr, uint16_t data, size_t nBytes)
 {
@@ -92,11 +94,11 @@ static inline void insertSample(uint8_t **p_ptr, uint16_t data, size_t nBytes)
 
 // Gets the color components from the palette, which is 8b, and
 // scales them to peakVal, so that UINT8_MAX is converted to peakVal
-static void led_getColorsLin(uint16_t *colors, ledCfg_t *ledCfg, uint16_t peakVal)
+static void sig_getColorsLin(uint16_t *colors, sigCfg_t *sigCfg, uint16_t peakVal)
 {
 	uint8_t i;
-	for(i=0; i<ledCfg->nChannels; i++)
-		colors[i] = ((uint32_t)peakVal * palette[ledCfg->color].ch[i]) / UINT8_MAX;
+	for(i=0; i<sigCfg->nChannels; i++)
+		colors[i] = ((uint32_t)peakVal * palette[sigCfg->color].ch[i]) / UINT8_MAX;
 }
 
 
@@ -120,13 +122,13 @@ static inline uint16_t getLogConv(uint8_t color)
 }
 
 
-static void led_getColorsLog(uint16_t *colors, ledCfg_t *ledCfg, uint16_t peakVal)
+static void sig_getColorsLog(uint16_t *colors, sigCfg_t *sigCfg, uint16_t peakVal)
 {
 	uint8_t i;
 
-	for(i=0; i<ledCfg->nChannels; i++)
+	for(i=0; i<sigCfg->nChannels; i++)
 	{
-		colors[i] = getLogConv(palette[ledCfg->color].ch[i]); // Get color components from palette
+		colors[i] = getLogConv(palette[sigCfg->color].ch[i]); // Get color components from palette
 		colors[i] = ((uint32_t)peakVal * colors[i]) / UINT16_MAX;
 	}
 }
@@ -136,142 +138,162 @@ static void led_getColorsLog(uint16_t *colors, ledCfg_t *ledCfg, uint16_t peakVa
  ******************************************/
 
 
-static void led_genPatSqr(ledCfg_t *ledCfg)
+static void sig_genPatSqr(sigCfg_t *sigCfg)
 {
-	uint16_t peakVal   = ((uint32_t)ledCfg->upperLimit * ledCfg->intensity) / 100U;
-	uint32_t nElemHigh = ((uint32_t)ledCfg->nElem * ledCfg->duty) / 100UL;
-	uint32_t nElemLow  = ledCfg->nElem - nElemHigh;
+	uint16_t peakVal   = ((uint32_t)sigCfg->upperLimit * sigCfg->intensity) / 100U;
+	uint32_t nElemHigh = ((uint32_t)sigCfg->nElem * sigCfg->duty) / 100UL;
+	uint32_t nElemLow  = sigCfg->nElem - nElemHigh;
 	uint16_t colors[3];
 	uint8_t  i;
 
-	if(ledCfg->useLogScale)
-		led_getColorsLog(colors, ledCfg, peakVal);
+	if(sigCfg->useLogScale)
+		sig_getColorsLog(colors, sigCfg, peakVal);
 	else
-		led_getColorsLin(colors, ledCfg, peakVal);
+		sig_getColorsLin(colors, sigCfg, peakVal);
 
 	for(; nElemHigh>0; nElemHigh--)
-		for(i=0;i<ledCfg->nChannels;i++)
-			insertSample(&ledCfg->buffer, colors[i], ledCfg->sampleSize);
-	memset(ledCfg->buffer, 0, nElemLow * ledCfg->nChannels * ledCfg->sampleSize);
+		for(i=0;i<sigCfg->nChannels;i++)
+			insertSample(&sigCfg->buffer, colors[i], sigCfg->sampleSize);
+	memset(sigCfg->buffer, 0, nElemLow * sigCfg->nChannels * sigCfg->sampleSize);
 }
 
 
-static void led_genPatRamp(ledCfg_t *ledCfg)
+static void sig_genPatRamp(sigCfg_t *sigCfg)
 {
-	uint16_t peakVal = ((uint32_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
+	uint16_t peakVal = ((uint32_t)sigCfg->upperLimit * sigCfg->intensity) / 100UL;
 	uint16_t value;
 	uint8_t colors[3];
 	uint32_t i, j;
 
 	// Get final color components for ramp
-	for(i=0; i<ledCfg->nChannels; i++)
-		colors[i] = palette[ledCfg->color].ch[i];
+	for(i=0; i<sigCfg->nChannels; i++)
+		colors[i] = palette[sigCfg->color].ch[i];
 
 	// Build ramp with colors scaled linearly or in a logarithmic way
-	for(j=0; j<ledCfg->nElem; j++)
+	for(j=0; j<sigCfg->nElem; j++)
 	{
-		for(i=0;i<ledCfg->nChannels;i++)
+		for(i=0;i<sigCfg->nChannels;i++)
 		{
-			value = ((uint32_t)colors[i] * j)/ledCfg->nElem;
-			if(ledCfg->useLogScale)
+			value = ((uint32_t)colors[i] * j)/sigCfg->nElem;
+			if(sigCfg->useLogScale)
 			{
 				value = getLogConv(value);
 				value = ((uint32_t)peakVal * value) / UINT16_MAX;
-
-			}else
+			}
+			else
 			{
 				value = ((uint32_t)peakVal * value) / UINT8_MAX;
 			}
-
-			insertSample(&ledCfg->buffer, value, ledCfg->sampleSize);
+			insertSample(&sigCfg->buffer, value, sigCfg->sampleSize);
 		}
 	}
 }
 
 
-static void led_genPatTri(ledCfg_t *ledCfg)
+static void sig_genPatTri(sigCfg_t *sigCfg)
 {
-	uint16_t peakVal  = ((uint32_t)ledCfg->upperLimit * ledCfg->intensity) / 100UL;
+	uint16_t peakVal = ((uint32_t)sigCfg->upperLimit * sigCfg->intensity) / 100UL;
 	uint16_t value;
 	uint8_t colors[3];
-	uint32_t i, j;
+	uint32_t i, j, k;
 
 	// Get final color components for ramp
-	for(i=0; i<ledCfg->nChannels; i++)
-		colors[i] = palette[ledCfg->color].ch[i];
+	for(i=0; i<sigCfg->nChannels; i++)
+		colors[i] = palette[sigCfg->color].ch[i];
 
-	for(j=0; j<ledCfg->nElem/2; j++)
+	for(k=0;k<2;k++)
 	{
-		for(i=0;i<ledCfg->nChannels;i++)
+		for(j=0; j<sigCfg->nElem/2; j++)
 		{
-			value = ((uint32_t)colors[i] * j)/(ledCfg->nElem / 2);
-			if(ledCfg->useLogScale)
+			for(i=0;i<sigCfg->nChannels;i++)
 			{
-				value = getLogConv(value);
-				value = ((uint32_t)peakVal * value) / UINT16_MAX;
-			}else{
-				value = ((uint32_t)peakVal * value) / UINT8_MAX;
+				value = ((uint32_t)colors[i] * j)/(sigCfg->nElem / 2);
+				if(k==1) value = UINT8_MAX - value;		// Invert if in second half
+
+				if(sigCfg->useLogScale)
+				{
+					value = getLogConv(value);
+					value = ((uint32_t)peakVal * value) / UINT16_MAX;
+				}else{
+					value = ((uint32_t)peakVal * value) / UINT8_MAX;
+				}
+				insertSample(&sigCfg->buffer, value, sigCfg->sampleSize);
 			}
-			insertSample(&ledCfg->buffer, value, ledCfg->sampleSize);
 		}
-	}
 
-	for(; j>0; j--)
+	}
+}
+
+
+static void sig_genPatSine(sigCfg_t *sigCfg)
+{
+	uint16_t peakVal  = ((uint32_t)sigCfg->upperLimit * sigCfg->intensity) / 100UL;
+	uint16_t value;
+	uint8_t idx;
+	uint8_t colors[3];
+	uint32_t i, j, k;
+
+	for(i=0; i<sigCfg->nChannels; i++)
+		colors[i] = palette[sigCfg->color].ch[i];
+
+	for(k=0; k<4; k++)							// Iterations for each quarter of the sinusoidal
 	{
-		for(i=0;i<ledCfg->nChannels;i++)
+		for(j=0; j<sigCfg->nElem/4; j++)		// Iterations for each element of the quarter
 		{
-			value = ((uint32_t)colors[i] * j)/(ledCfg->nElem / 2);
-			if(ledCfg->useLogScale)
+			for(i=0;i<sigCfg->nChannels;i++)	// For each of the channels in a sample
 			{
-				value = getLogConv(value);
-				value = ((uint32_t)peakVal * value) / UINT16_MAX;
-			}else{
-				value = ((uint32_t)peakVal * value) / UINT8_MAX;
+				// Get color from the palette scaled by the sine curve
+				idx = UINT8_MAX * j / (sigCfg->nElem/4);
+				idx = (k & 0x01) ? UINT8_MAX - idx : idx;
+				value = sineQuarter[idx/8] + (sineQuarter[(idx/8)+1] - sineQuarter[idx/8])*(idx%8)/8;
+				value = (k > 1) ? (UINT16_MAX/2 + 1) - value/2 : (UINT16_MAX/2 + 1) + value/2;
+				value = ((uint32_t)colors[i] * value) / UINT8_MAX;
+
+				if(sigCfg->useLogScale)
+				{
+					value = getLogConv(value>>8);
+					value = ((uint32_t)peakVal * value) / UINT16_MAX;
+				}else{
+					value = ((uint32_t)peakVal * value) / UINT16_MAX;
+				}
+				insertSample(&sigCfg->buffer, value, sigCfg->sampleSize);
 			}
-			insertSample(&ledCfg->buffer, value, ledCfg->sampleSize);
 		}
 	}
 }
 
 
-static void led_genPatSine(ledCfg_t *ledCfg)
+sigErr_t sig_genPattern(sigCfg_t *sigCfg)
 {
-
-	//val[i] = sineQuarter[i/8] + (sineQuarter[(i/8)+1] - sineQuarter[i/8])*(i%8)/8
-}
-
-
-ledErr_t led_genPattern(ledCfg_t *ledCfg)
-{
-	if(ledCfg->buffer    == NULL
-			|| ledCfg->color     >= LED_COLOR_CNT
-			|| ledCfg->pattern   >= LED_PAT_CNT
-			|| ledCfg->nChannels == 0
-			|| ledCfg->nChannels <  palette[ledCfg->color].nChReq
-			|| ledCfg->nChannels >  3
-			|| (ledCfg->pattern == LED_PAT_SQR && ledCfg->duty > 100)
-			|| ledCfg->intensity >  100
-			|| (ledCfg->sampleSize != 1 && ledCfg->sampleSize != 2)
-			|| ledCfg->nElem >= (1<<24))
-		return LED_ERR_INVALID_PARAMS;
+	if(sigCfg->buffer    == NULL
+			|| sigCfg->color     >= SIG_COLOR_CNT
+			|| sigCfg->pattern   >= SIG_PAT_CNT
+			|| sigCfg->nChannels == 0
+			|| sigCfg->nChannels <  palette[sigCfg->color].nChReq
+			|| sigCfg->nChannels >  3
+			|| (sigCfg->pattern == SIG_PAT_SQR && sigCfg->duty > 100)
+			|| sigCfg->intensity >  100
+			|| (sigCfg->sampleSize != 1 && sigCfg->sampleSize != 2)
+			|| sigCfg->nElem >= (1<<24))
+		return SIG_ERR_INVALID_PARAMS;
 
 
-	switch(ledCfg->pattern){
-	case LED_PAT_SQR:
-		led_genPatSqr(ledCfg);
+	switch(sigCfg->pattern){
+	case SIG_PAT_SQR:
+		sig_genPatSqr(sigCfg);
 		break;
-	case LED_PAT_RAMP:
-		led_genPatRamp(ledCfg);
+	case SIG_PAT_RAMP:
+		sig_genPatRamp(sigCfg);
 		break;
-	case LED_PAT_SINE:
-		led_genPatSine(ledCfg);
+	case SIG_PAT_SINE:
+		sig_genPatSine(sigCfg);
 		break;
-	case LED_PAT_TRI:
-		led_genPatTri(ledCfg);
+	case SIG_PAT_TRI:
+		sig_genPatTri(sigCfg);
 		break;
 	default:
-		return LED_ERR_UNKNOWN;
+		return SIG_ERR_UNKNOWN;
 	}
 
-	return LED_ERR_SUCCESS;
+	return SIG_ERR_SUCCESS;
 }
